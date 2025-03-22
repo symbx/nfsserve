@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use std::cmp::Ordering;
 use std::sync::Once;
 use std::time::SystemTime;
+use crate::rpc::auth_unix;
+
 #[derive(Default, Debug)]
 pub struct DirEntrySimple {
     pub fileid: fileid3,
@@ -106,34 +108,129 @@ pub trait NFSFileSystem: Sync {
     /// and this should return the id of the file "dir/a.txt"
     ///
     /// This method should be fast as it is used very frequently.
-    async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3>;
+    async fn lookup(&self, dirid: fileid3, filename: &filename3, user_ctx : &UserContext, dir_attr : &mut post_op_attr, obj_attr : &mut post_op_attr) -> Result<fileid3, nfsstat3> {
+        *dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+        let result = self.lookup_impl(dirid, filename).await;
+        match result {
+            Ok(fid) => {
+                *obj_attr = match self.getattr(fid, user_ctx).await {
+                    Ok(v) => post_op_attr::attributes(v),
+                    Err(_) => post_op_attr::Void,
+                };
+            }
+            Err(_) => {
+            }
+        }
+        result
+    }
+
+    async fn lookup_impl(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3>;
 
     /// Returns the attributes of an id.
     /// This method should be fast as it is used very frequently.
-    async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3>;
+    async fn getattr(&self, id: fileid3, user_ctx : &UserContext) -> Result<fattr3, nfsstat3> {
+        self.getattr_impl(id).await
+    }
+    async fn getattr_impl(&self, id: fileid3) -> Result<fattr3, nfsstat3>;
 
     /// Sets the attributes of an id
     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
-    async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3>;
+    async fn setattr(&self, id: fileid3, setattr: sattr3, user_ctx : &UserContext) -> Result<fattr3, nfsstat3> {
+        self.setattr_impl(id, setattr).await
+    }
+    async fn setattr_impl(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3>;
+
+    /// Checks access permissions
+    async fn access(&self, id: fileid3, access : u32, user_ctx : &UserContext, obj_attr : &mut post_op_attr) -> Result<u32, nfsstat3> {
+        *obj_attr = match self.getattr(id, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(stat) =>  {
+                return Err(stat)
+            }
+        };
+
+        let mut new_access : u32 = access;
+        if !matches!(self.capabilities(), VFSCapabilities::ReadWrite) {
+            new_access &= ACCESS3_READ | ACCESS3_LOOKUP;
+        }
+
+        Ok(new_access)
+    }
 
     /// Reads the contents of a file returning (bytes, EOF)
     /// Note that offset/count may go past the end of the file and that
     /// in that case, all bytes till the end of file are returned.
     /// EOF must be flagged if the end of the file is reached by the read.
-    async fn read(&self, id: fileid3, offset: u64, count: u32)
-        -> Result<(Vec<u8>, bool), nfsstat3>;
+    async fn read(&self, id: fileid3, offset: u64, count: u32, user_ctx : &UserContext, obj_attr : &mut post_op_attr)
+        -> Result<(Vec<u8>, bool), nfsstat3> {
+        *obj_attr = match self.getattr(id, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+        self.read_impl(id, offset, count).await
+    }
+    async fn read_impl(&self, id: fileid3, offset: u64, count: u32)
+                  -> Result<(Vec<u8>, bool), nfsstat3>;
 
     /// Writes the contents of a file returning (bytes, EOF)
     /// Note that offset/count may go past the end of the file and that
     /// in that case, the file is extended.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
+    async fn write(&self, id: fileid3, offset: u64, data: &[u8], user_ctx : &UserContext, obj_attr : &mut pre_op_attr) -> Result<fattr3, nfsstat3> {
+        *obj_attr = match self.getattr(id, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(_) => pre_op_attr::Void,
+        };
+        self.write_impl(id, offset, data).await
+    }
+    async fn write_impl(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
 
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn create(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
+        attr: sattr3,
+        user_ctx : &UserContext,
+        pre_dir_attr : &mut pre_op_attr,
+        post_dir_attr : &mut post_op_attr,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        *pre_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(_) => pre_op_attr::Void,
+        };
+
+        let result = self.create_impl(dirid, filename, attr).await;
+
+        // Re-read dir attributes for post op attr
+        *post_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        result
+    }
+    async fn create_impl(
         &self,
         dirid: fileid3,
         filename: &filename3,
@@ -146,6 +243,37 @@ pub trait NFSFileSystem: Sync {
         &self,
         dirid: fileid3,
         filename: &filename3,
+        user_ctx : &UserContext,
+        pre_dir_attr : &mut pre_op_attr,
+        post_dir_attr : &mut post_op_attr,
+    ) -> Result<fileid3, nfsstat3> {
+        *pre_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(stat) =>
+                return Err(stat)
+        };
+
+        let result = self.create_exclusive_impl(dirid, filename).await;
+
+        // Re-read dir attributes for post op attr
+        *post_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        result
+    }
+    async fn create_exclusive_impl(
+        &self,
+        dirid: fileid3,
+        filename: &filename3,
     ) -> Result<fileid3, nfsstat3>;
 
     /// Makes a directory with the following attributes.
@@ -155,17 +283,132 @@ pub trait NFSFileSystem: Sync {
         &self,
         dirid: fileid3,
         dirname: &filename3,
+        user_ctx : &UserContext,
+        pre_dir_attr : &mut pre_op_attr,
+        post_dir_attr : &mut post_op_attr,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        // get the object attributes before the write
+        *pre_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(stat) => {
+                return Err(stat)
+            }
+        };
+
+        let result = self.mkdir_impl(dirid, dirname).await;
+
+        // Re-read dir attributes for post op attr
+        *post_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        result
+    }
+    async fn mkdir_impl(
+        &self,
+        dirid: fileid3,
+        dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
     /// Removes a file.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3>;
+    async fn remove(&self, dirid: fileid3, filename: &filename3, user_ctx : &UserContext, pre_dir_attr : &mut pre_op_attr, post_dir_attr : &mut post_op_attr) -> Result<(), nfsstat3> {
+        // get the object attributes before the write
+        *pre_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(stat) => {
+                return Err(stat)
+            }
+        };
 
-    /// Removes a file.
+        let result = self.remove_impl(dirid, filename).await;
+
+        // Re-read dir attributes for post op attr
+        *post_dir_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        result
+    }
+    async fn remove_impl(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3>;
+
+    /// Rename a file.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
     async fn rename(
+        &self,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
+        user_ctx : &UserContext,
+        pre_from_dir_attr : &mut pre_op_attr,
+        pre_to_dir_attr : &mut pre_op_attr,
+        post_from_dir_attr : &mut post_op_attr,
+        post_to_dir_attr : &mut post_op_attr,
+    ) -> Result<(), nfsstat3> {
+        // get the object attributes before the write
+        *pre_from_dir_attr = match self.getattr(from_dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(stat) => {
+                return Err(stat)
+            }
+        };
+
+        // get the object attributes before the write
+        *pre_to_dir_attr = match self.getattr(to_dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(stat) => {
+                return Err(stat)
+            }
+        };
+
+        let result = self.rename_impl(from_dirid, from_filename, to_dirid, to_filename).await;
+
+        // Re-read dir attributes for post op attr
+        *post_from_dir_attr = match self.getattr(from_dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+        *post_to_dir_attr = match self.getattr(to_dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        result
+    }
+    async fn rename_impl(
         &self,
         from_dirid: fileid3,
         from_filename: &filename3,
@@ -186,6 +429,7 @@ pub trait NFSFileSystem: Sync {
         dirid: fileid3,
         start_after: fileid3,
         max_entries: usize,
+        user_ctx : &UserContext,
     ) -> Result<ReadDirResult, nfsstat3>;
 
     /// Simple version of readdir.
@@ -194,9 +438,10 @@ pub trait NFSFileSystem: Sync {
         &self,
         dirid: fileid3,
         count: usize,
+        user_ctx : &UserContext,
     ) -> Result<ReadDirSimpleResult, nfsstat3> {
         Ok(ReadDirSimpleResult::from_readdir_result(
-            &self.readdir(dirid, 0, count).await?,
+            &self.readdir(dirid, 0, count, user_ctx).await?,
         ))
     }
 
@@ -209,18 +454,64 @@ pub trait NFSFileSystem: Sync {
         linkname: &filename3,
         symlink: &nfspath3,
         attr: &sattr3,
+        user_ctx : &UserContext,
+        pre_obj_attr : &mut pre_op_attr,
+        post_obj_attr : &mut post_op_attr,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        // get the object attributes before
+        *pre_obj_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => {
+                let wccattr = wcc_attr {
+                    size: v.size,
+                    mtime: v.mtime,
+                    ctime: v.ctime,
+                };
+                pre_op_attr::attributes(wccattr)
+            }
+            Err(stat) => {
+                return Err(stat)
+            }
+        };
+
+        let result = self.symlink_impl(dirid, linkname, symlink, attr).await;
+
+        // Re-read dir attributes for post op attr
+        *post_obj_attr = match self.getattr(dirid, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(_) => post_op_attr::Void,
+        };
+
+        result
+    }
+
+    async fn symlink_impl(
+        &self,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfspath3,
+        attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3>;
 
     /// Reads a symlink
-    async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3>;
+    async fn readlink(&self, id: fileid3, user_ctx: &UserContext, symlink_attr : &mut post_op_attr) -> Result<nfspath3, nfsstat3> {
+        *symlink_attr = match self.getattr(id, user_ctx).await {
+            Ok(v) => post_op_attr::attributes(v),
+            Err(stat) => {
+                return Err(stat)
+            }
+        };
+        self.readlink_impl(id).await
+    }
+    async fn readlink_impl(&self, id: fileid3) -> Result<nfspath3, nfsstat3>;
 
     /// Get static file system Information
     async fn fsinfo(
         &self,
         root_fileid: fileid3,
+        user_ctx : &UserContext,
     ) -> Result<fsinfo3, nfsstat3> {
 
-        let dir_attr: nfs::post_op_attr = match self.getattr(root_fileid).await {
+        let dir_attr: nfs::post_op_attr = match self.getattr(root_fileid, user_ctx).await {
             Ok(v) => nfs::post_op_attr::attributes(v),
             Err(_) => nfs::post_op_attr::Void,
         };
@@ -275,7 +566,7 @@ pub trait NFSFileSystem: Sync {
             if component.is_empty() {
                 continue;
             }
-            fid = self.lookup(fid, &component.into()).await?;
+            fid = self.lookup_impl(fid, &component.into()).await?;
         }
         Ok(fid)
     }
@@ -283,5 +574,24 @@ pub trait NFSFileSystem: Sync {
     fn serverid(&self) -> cookieverf3 {
         let gennum = get_generation_number();
         gennum.to_le_bytes()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct UserContext {
+    _uid: u32,
+    _gid: u32,
+    _gids: Vec<u32>,
+}
+
+impl UserContext {
+    pub fn new(uid: u32, gid: u32, gids: Vec<u32>) -> Self {
+        Self { _uid: uid, _gid: gid, _gids: gids }
+    }
+}
+
+impl From<&auth_unix> for UserContext {
+    fn from(auth: &auth_unix) -> Self {
+        Self { _uid: auth.uid, _gid: auth.gid, _gids: auth.gids.clone() }
     }
 }
